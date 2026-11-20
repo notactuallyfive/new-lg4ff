@@ -1,9 +1,22 @@
 # new-lg4ff for Linux
 
 ## Expermimental LUT support in new-lg4ff
-Install numpy, then run using python3 load_lut.py -r -s 0.56 -t 6
 
-Replace wheelcheck.csv with your wheel's wheelcheck
+Edit your /etc/udev/rules.d/99-logitech-wheel-perms.rules file so your wheel model has ffb_lut included
+
+eg from 
+
+# Logitech G27 Driving Force Racing Wheel
+ATTRS{idProduct}=="c29b", RUN+="/bin/sh -c 'cd %S%p; chmod 666 alternate_modes combine_pedals range gain autocenter spring_level damper_level friction_level ffb_leds peak_ffb_level leds/*/brightness; chmod 777 leds/ leds/*'"
+
+to
+
+ATTRS{idProduct}=="c29b", RUN+="/bin/sh -c 'cd %S%p; chmod 666 alternate_modes combine_pedals range gain autocenter spring_level damper_level friction_level ffb_leds peak_ffb_level ffb_lut leds/*/brightness; chmod 777 leds/ leds/*'"
+
+then tnstall numpy, and run using python3 load_lut.py -r -s 0.56 -t 6
+
+You can replace wheelcheck.csv with your wheel's wheelcheck.csv, or use the optional RasmusP style linear taper if you don't have one.
+
 -s (strength) determines feedback strength beyond initial anti-deadzone
 -t taper determines how smoothly anti deadzone tapers off (higher = more gentle)
 -r (optional) flag implements RasmusP style linear taper and ignores wheelcheck.csv
