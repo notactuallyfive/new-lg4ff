@@ -1,5 +1,15 @@
 # new-lg4ff for Linux
 
+## Expermimental LUT support in new-lg4ff
+Install numpy, then run using python3 load_lut.py -r -s 0.56 -t 6
+
+Replace wheelcheck.csv with your wheel's wheelcheck
+-s (strength) determines feedback strength beyond initial anti-deadzone
+-t taper determines how smoothly anti deadzone tapers off (higher = more gentle)
+-r (optional) flag implements RasmusP style linear taper and ignores wheelcheck.csv
+
+## README follows...
+
 Improved Linux module driver for Logitech driving wheels.
 
 Thanks to Oleg Makarenko for adding support for the Logitech G923 Racing
