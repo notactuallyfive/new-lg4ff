@@ -94,6 +94,8 @@
 #define FF_EFFECT_PLAYING 2
 #define FF_EFFECT_UPDATING 3
 
+#define LG4FF_LUT_SIZE 256
+
 struct lg4ff_effect_state {
 	struct ff_effect effect;
 	struct ff_envelope *envelope;
@@ -156,7 +158,10 @@ struct lg4ff_wheel_data {
 
 struct lg4ff_device_entry {
 	spinlock_t report_lock; /* Protect output HID report */
-	spinlock_t timer_lock;
+	spinlock_t timer_lock; /* LUT params */
+	spinlock_t lut_lock; /* LUT params */
+	bool lut_enabled; /* LUT params */
+	u16 ffb_lut[LG4FF_LUT_SIZE]; /* LUT params */
 	struct hid_report *report;
 	struct lg4ff_wheel_data wdata;
 	struct hid_device *hid;
@@ -170,6 +175,45 @@ struct lg4ff_device_entry {
 	int has_leds;
 #endif
 };
+
+
+/* LUT calculation func */
+static s32 lg4ff_apply_lut(struct lg4ff_device_entry *entry, s32 force)
+{
+	unsigned long flags;
+	s32 sign;
+	u32 abs_force, idx, frac, y0, y1, mapped;
+
+	if (!READ_ONCE(entry->lut_enabled) || force == 0)
+		return force;
+
+	sign = (force < 0) ? -1 : 1;
+	abs_force = abs(force);
+	if (abs_force > 32767)
+		abs_force = 32767;
+
+	spin_lock_irqsave(&entry->lut_lock, flags);
+
+	if (abs_force == 32767) {
+		mapped = entry->ffb_lut[LG4FF_LUT_SIZE - 1];
+	} else {
+		/* Map 0..32767 into 0..254 index + 8-bit fractional remainder */
+		idx = (abs_force * (LG4FF_LUT_SIZE - 1)) >> 15;
+		frac = ((abs_force * (LG4FF_LUT_SIZE - 1)) & 0x7FFF) >> 7;
+
+		y0 = entry->ffb_lut[idx];
+		y1 = entry->ffb_lut[idx + 1];
+
+		if (y1 >= y0)
+			mapped = y0 + (((y1 - y0) * frac) >> 8);
+		else
+			mapped = y0 - (((y0 - y1) * frac) >> 8);
+	}
+
+	spin_unlock_irqrestore(&entry->lut_lock, flags);
+
+	return sign * (s32)((mapped * 32767) >> 16);
+}
 
 static const signed short lg4ff_wheel_effects[] = {
 	FF_CONSTANT,
@@ -891,6 +935,9 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 	}
 
 	spin_unlock_irqrestore(&entry->timer_lock, flags);
+
+	//Apply LUT
+	parameters[0].level = lg4ff_apply_lut(entry, parameters[0].level);
 
 	parameters[0].level = (long)parameters[0].level * gain / 0xffff;
 
@@ -2018,6 +2065,90 @@ static ssize_t lg4ff_peak_ffb_level_store(struct device *dev, struct device_attr
 }
 static DEVICE_ATTR(peak_ffb_level, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_peak_ffb_level_show, lg4ff_peak_ffb_level_store);
 
+static ssize_t lg4ff_ffb_lut_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry = lg4ff_get_device_entry(hid);
+	unsigned long flags;
+	ssize_t count = 0;
+	int i;
+
+	if (!entry)
+		return -EINVAL;
+
+	if (!READ_ONCE(entry->lut_enabled))
+		return sysfs_emit(buf, "disabled\n");
+
+	spin_lock_irqsave(&entry->lut_lock, flags);
+	for (i = 0; i < LG4FF_LUT_SIZE; i++) {
+		count += sysfs_emit_at(buf, count, "%u%c",
+				       entry->ffb_lut[i],
+				       (i == LG4FF_LUT_SIZE - 1) ? '\n' : ' ');
+	}
+	spin_unlock_irqrestore(&entry->lut_lock, flags);
+
+	return count;
+}
+
+static ssize_t lg4ff_ffb_lut_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry = lg4ff_get_device_entry(hid);
+	u16 temp_lut[LG4FF_LUT_SIZE];
+	char *kbuf, *p, *tok;
+	unsigned long flags;
+	u16 val;
+	int i = 0, ret;
+
+	if (!entry)
+		return -EINVAL;
+
+	/* Disable LUT if "off", "disabled", or "0" is written */
+	if (sysfs_streq(buf, "off") || sysfs_streq(buf, "disabled") || sysfs_streq(buf, "0")) {
+		spin_lock_irqsave(&entry->lut_lock, flags);
+		WRITE_ONCE(entry->lut_enabled, false);
+		spin_unlock_irqrestore(&entry->lut_lock, flags);
+		return count;
+	}
+
+	kbuf = kstrndup(buf, count, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	p = kbuf;
+	while ((tok = strsep(&p, " ,\t\n")) != NULL) {
+		if (*tok == '\0')
+			continue;
+		if (i >= LG4FF_LUT_SIZE) {
+			kfree(kbuf);
+			return -EINVAL;
+		}
+		ret = kstrtou16(tok, 10, &val);
+		if (ret) {
+			kfree(kbuf);
+			return ret;
+		}
+		temp_lut[i++] = val;
+	}
+	kfree(kbuf);
+
+	if (i != LG4FF_LUT_SIZE)
+		return -EINVAL;
+
+	spin_lock_irqsave(&entry->lut_lock, flags);
+	memcpy(entry->ffb_lut, temp_lut, sizeof(temp_lut));
+	WRITE_ONCE(entry->lut_enabled, true);
+	spin_unlock_irqrestore(&entry->lut_lock, flags);
+
+	return count;
+}
+
+static DEVICE_ATTR(ffb_lut, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+		   lg4ff_ffb_lut_show, lg4ff_ffb_lut_store);
+
 #ifdef CONFIG_LEDS_CLASS
 
 static ssize_t lg4ff_ffb_leds_show(struct device *dev, struct device_attribute *attr,
@@ -2425,6 +2556,12 @@ int lg4ff_init(struct hid_device *hid)
 	}
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
+		spin_lock_init(&entry->lut_lock);
+		entry->lut_enabled = false;
+		error = device_create_file(&hid->dev, &dev_attr_ffb_lut);
+		if (error)
+			hid_warn(hid, "Unable to create sysfs interface for \"ffb_lut\", errno %d\n", error);
+
 		error = device_create_file(&hid->dev, &dev_attr_gain);
 		if (error)
 			hid_warn(hid, "Unable to create sysfs interface for \"gain\", errno %d\n", error);
@@ -2523,6 +2660,7 @@ int lg4ff_deinit(struct hid_device *hid)
 	device_remove_file(&hid->dev, &dev_attr_range);
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
+		device_remove_file(&hid->dev, &dev_attr_ffb_lut);
 		device_remove_file(&hid->dev, &dev_attr_gain);
 		if (test_bit(FF_AUTOCENTER, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_autocenter);
